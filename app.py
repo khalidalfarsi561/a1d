@@ -338,6 +338,95 @@ def sanitize_filename(name: str) -> str:
     return cleaned or f"image_{uuid4().hex}.png"
 
 
+def _now_ts() -> float:
+    return time.time()
+
+
+def _empty_batch_state(request_id: str, total: int) -> Dict[str, Any]:
+    return {
+        "requestId": request_id,
+        "total": total,
+        "completed": 0,
+        "successCount": 0,
+        "errorCount": 0,
+        "percent": 0,
+        "status": "queued",
+        "results": [],
+        "downloadUrl": None,
+        "startedAt": _now_ts(),
+        "updatedAt": _now_ts(),
+        "finishedAt": None,
+        "error": None,
+    }
+
+
+def _normalize_result_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = {
+        "filename": item.get("filename"),
+        "original_filename": item.get("original_filename"),
+        "status": item.get("status"),
+    }
+    if item.get("error") is not None:
+        normalized["error"] = item.get("error")
+    if item.get("public_url") is not None:
+        normalized["public_url"] = item.get("public_url")
+    if item.get("upscaled_url") is not None:
+        normalized["upscaled_url"] = item.get("upscaled_url")
+    return normalized
+
+
+class BatchJobStore:
+    def __init__(self) -> None:
+        self._jobs: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def create(self, request_id: str, total: int) -> Dict[str, Any]:
+        async with self._lock:
+            state = _empty_batch_state(request_id, total)
+            self._jobs[request_id] = state
+            return state
+
+    async def update(self, request_id: str, **changes: Any) -> Dict[str, Any]:
+        async with self._lock:
+            state = self._jobs.get(request_id)
+            if state is None:
+                raise KeyError(request_id)
+            state.update(changes)
+            state["updatedAt"] = _now_ts()
+            if state.get("total"):
+                completed = int(state.get("completed") or 0)
+                total = int(state.get("total") or 0)
+                state["percent"] = int((completed / total) * 100) if total else 0
+            return state
+
+    async def append_result(self, request_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        async with self._lock:
+            state = self._jobs.get(request_id)
+            if state is None:
+                raise KeyError(request_id)
+            state["results"].append(_normalize_result_item(result))
+            state["updatedAt"] = _now_ts()
+            return state
+
+    async def get(self, request_id: str) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            state = self._jobs.get(request_id)
+            return json.loads(json.dumps(state)) if state is not None else None
+
+    async def get_result_summary(self, request_id: str, filename: str) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            state = self._jobs.get(request_id)
+            if state is None:
+                return None
+            for item in state.get("results", []):
+                if item.get("filename") == filename:
+                    return json.loads(json.dumps(item))
+            return None
+
+
+BATCH_STORE = BatchJobStore()
+
+
 async def process_one_image(
     *,
     settings: Settings,
@@ -345,6 +434,7 @@ async def process_one_image(
     out_dir: Path,
     semaphore: asyncio.Semaphore,
     index: int,
+    request_id: str,
 ) -> Dict[str, Any]:
     """
     Process a single image end-to-end.
@@ -364,6 +454,15 @@ async def process_one_image(
             out_name = f"{stem}_upscaled_{uuid4().hex[:8]}{suffix}"
 
         out_path = out_dir / out_name
+
+        await BATCH_STORE.append_result(
+            request_id,
+            {
+                "filename": out_name,
+                "original_filename": original_basename,
+                "status": "processing",
+            },
+        )
 
         try:
             content = await upload.read()
@@ -410,22 +509,37 @@ async def process_one_image(
             # Save with the preserved original filename (or derived _upscaled_ name).
             out_path.write_bytes(upscaled_bytes)
 
-            return {
+            result = {
                 "filename": out_name,
                 "original_filename": original_basename,
                 "status": "success",
                 "public_url": public_url,
                 "upscaled_url": upscaled_url,
             }
+            await BATCH_STORE.append_result(request_id, result)
+            await BATCH_STORE.update(
+                request_id,
+                completed=int((await BATCH_STORE.get(request_id) or {}).get("completed", 0)) + 1,
+                successCount=int((await BATCH_STORE.get(request_id) or {}).get("successCount", 0)) + 1,
+                status="processing",
+            )
+            return result
 
         except Exception as exc:
-            # Continue on error; return error info
-            return {
+            result = {
                 "filename": out_name,
                 "original_filename": original_basename,
                 "status": "error",
                 "error": str(exc),
             }
+            await BATCH_STORE.append_result(request_id, result)
+            await BATCH_STORE.update(
+                request_id,
+                completed=int((await BATCH_STORE.get(request_id) or {}).get("completed", 0)) + 1,
+                errorCount=int((await BATCH_STORE.get(request_id) or {}).get("errorCount", 0)) + 1,
+                status="processing",
+            )
+            return result
         finally:
             await upload.close()
 
@@ -491,6 +605,9 @@ async def batch_upscale(
     out_dir = work_dir / "upscaled"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    await BATCH_STORE.create(request_id, len(files))
+    await BATCH_STORE.update(request_id, status="processing")
+
     semaphore = asyncio.Semaphore(settings.concurrency)
 
     # Process with limited concurrency
@@ -501,6 +618,7 @@ async def batch_upscale(
             out_dir=out_dir,
             semaphore=semaphore,
             index=i,
+            request_id=request_id,
         )
         for i, f in enumerate(files, start=1)
     ]
@@ -524,16 +642,57 @@ async def batch_upscale(
         # No successes -> cleanup immediately
         shutil.rmtree(work_dir, ignore_errors=True)
 
+    final_status = "completed" if len(errors) == 0 else ("completed_with_errors" if len(successes) > 0 else "failed")
+    await BATCH_STORE.update(
+        request_id,
+        completed=len(results),
+        successCount=len(successes),
+        errorCount=len(errors),
+        status=final_status,
+        downloadUrl=zip_url,
+        finishedAt=_now_ts(),
+    )
     return JSONResponse(
         {
             "requestId": request_id,
             "total": len(files),
+            "completed": len(results),
             "successCount": len(successes),
             "errorCount": len(errors),
+            "percent": 100 if files else 0,
+            "status": final_status,
             "results": results,
             "downloadUrl": zip_url,
         }
     )
+
+
+@app.get("/api/batch-status/{request_id}")
+async def batch_status(request_id: str) -> JSONResponse:
+    state = await BATCH_STORE.get(request_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Batch job not found.")
+    return JSONResponse(
+        {
+            "requestId": state["requestId"],
+            "total": state["total"],
+            "completed": state["completed"],
+            "successCount": state["successCount"],
+            "errorCount": state["errorCount"],
+            "percent": state["percent"],
+            "status": state["status"],
+            "results": state["results"],
+            "downloadUrl": state["downloadUrl"],
+        }
+    )
+
+
+@app.get("/api/batch-status/{request_id}/results/{filename}")
+async def batch_result_summary(request_id: str, filename: str) -> JSONResponse:
+    result = await BATCH_STORE.get_result_summary(request_id, filename)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Result not found.")
+    return JSONResponse(result)
 
 
 @app.get("/api/download/{request_id}")
