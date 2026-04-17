@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>A1D Bulk Image Upscaler</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+
+  <body class="min-h-screen bg-slate-950 text-slate-100">
+    <div class="mx-auto max-w-4xl px-4 py-10">
+      <header class="mb-8">
+        <h1 class="text-2xl font-semibold tracking-tight">A1D Bulk Image Upscaler</h1>
+        <p class="mt-2 text-sm text-slate-300">
+          Select a local folder of images, then batch upscale them via ImgBB (temporary public URL) → A1D Upscaler → ZIP.
+        </p>
+      </header>
+
+      <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-6">
+        <div class="grid gap-4 md:grid-cols-3">
+          <div class="md:col-span-2">
+            <label
+              id="dropZone"
+              class="flex min-h-[170px] cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-700 bg-slate-950/40 p-6 text-center transition hover:border-slate-500"
+            >
+              <div class="text-base font-medium">Drag & drop images here</div>
+              <div class="mt-1 text-xs text-slate-400">
+                or click to select an entire folder (Chrome/Edge: <code>webkitdirectory</code>)
+              </div>
+
+              <input
+                id="folderInput"
+                class="hidden"
+                type="file"
+                webkitdirectory
+                directory
+                multiple
+                accept="image/*"
+              />
+            </label>
+
+            <div class="mt-3 text-sm text-slate-300">
+              Selected: <span id="selectedCount" class="font-semibold">0</span> files
+            </div>
+          </div>
+
+          <div class="space-y-4">
+            <div>
+              <label class="block text-sm font-medium text-slate-200">Scale</label>
+              <select
+                id="scaleSelect"
+                class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
+              >
+                <option value="2" selected>2x</option>
+                <option value="4">4x</option>
+              </select>
+            </div>
+
+            <div>
+              <label class="block text-sm font-medium text-slate-200">Concurrency</label>
+              <select
+                id="concurrencySelect"
+                class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
+              >
+                <option value="1">1 (Safest)</option>
+                <option value="2" selected>2 (Recommended)</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+                <option value="5">5 (Riskier)</option>
+              </select>
+              <p class="mt-1 text-xs text-slate-400">Limit concurrency to reduce API rate-limit risk.</p>
+            </div>
+
+            <button
+              id="startBtn"
+              class="w-full rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled
+            >
+              Start Batch Upscaling
+            </button>
+
+            <a
+              id="downloadBtn"
+              class="hidden w-full rounded-lg bg-emerald-600 px-4 py-2 text-center text-sm font-semibold text-white hover:bg-emerald-500"
+              href="#"
+              download
+            >
+              Download All (ZIP)
+            </a>
+          </div>
+        </div>
+
+        <div class="mt-6 border-t border-slate-800 pt-5">
+          <div class="flex items-center justify-between">
+            <div class="text-sm font-medium">Progress</div>
+            <div id="progressText" class="text-xs text-slate-400">Idle</div>
+          </div>
+
+          <div class="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-800">
+            <div id="progressBar" class="h-2 w-0 bg-indigo-500 transition-all"></div>
+          </div>
+
+          <div class="mt-4">
+            <div class="text-sm font-medium">Results</div>
+            <pre
+              id="resultsBox"
+              class="mt-2 max-h-72 overflow-auto rounded-xl border border-slate-800 bg-slate-950 p-3 text-xs text-slate-200"
+            >Waiting…</pre>
+          </div>
+        </div>
+      </section>
+
+      <footer class="mt-8 text-xs text-slate-500">
+        Notes: Your images are uploaded temporarily to ImgBB to generate public URLs (required by A1D). Use test images you are
+        comfortable uploading.
+      </footer>
+    </div>
+
+    <script>
+      const folderInput = document.getElementById("folderInput");
+      const dropZone = document.getElementById("dropZone");
+      const selectedCount = document.getElementById("selectedCount");
+      const startBtn = document.getElementById("startBtn");
+      const downloadBtn = document.getElementById("downloadBtn");
+      const progressText = document.getElementById("progressText");
+      const progressBar = document.getElementById("progressBar");
+      const resultsBox = document.getElementById("resultsBox");
+      const scaleSelect = document.getElementById("scaleSelect");
+      const concurrencySelect = document.getElementById("concurrencySelect");
+
+      /** @type {File[]} */
+      let selectedFiles = [];
+
+      function setProgress(current, total) {
+        const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+        progressBar.style.width = `${pct}%`;
+        progressText.textContent = total > 0 ? `Processing ${current} of ${total} (${pct}%)...` : "Idle";
+      }
+
+      function setResults(obj) {
+        resultsBox.textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
+      }
+
+      function updateUIAfterSelection() {
+        selectedCount.textContent = String(selectedFiles.length);
+        startBtn.disabled = selectedFiles.length === 0;
+        downloadBtn.classList.add("hidden");
+        downloadBtn.href = "#";
+        setProgress(0, 0);
+        setResults("Ready. Click “Start Batch Upscaling”.");
+      }
+
+      function isImageFile(file) {
+        return file && file.type && file.type.startsWith("image/");
+      }
+
+      folderInput.addEventListener("change", () => {
+        const files = Array.from(folderInput.files || []).filter(isImageFile);
+        selectedFiles = files;
+        updateUIAfterSelection();
+      });
+
+      // Drag & drop support (note: browsers won't give folder traversal via drag reliably;
+      // we still accept whatever files are dropped).
+      dropZone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        dropZone.classList.add("border-slate-400");
+      });
+      dropZone.addEventListener("dragleave", () => {
+        dropZone.classList.remove("border-slate-400");
+      });
+      dropZone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        dropZone.classList.remove("border-slate-400");
+        const files = Array.from(e.dataTransfer.files || []).filter(isImageFile);
+        selectedFiles = files;
+        // Keep the input in sync (optional). Some browsers don't allow setting files programmatically.
+        updateUIAfterSelection();
+      });
+
+      async function startBatchUpscale() {
+        if (!selectedFiles.length) return;
+
+        startBtn.disabled = true;
+        downloadBtn.classList.add("hidden");
+        setResults("Uploading & processing…");
+        setProgress(0, selectedFiles.length);
+
+        const formData = new FormData();
+        for (const f of selectedFiles) formData.append("files", f, f.name);
+        formData.append("scale", scaleSelect.value);
+        formData.append("concurrency", concurrencySelect.value);
+
+        try {
+          const resp = await fetch("/api/batch-upscale", {
+            method: "POST",
+            body: formData,
+          });
+
+          const data = await resp.json().catch(() => null);
+
+          if (!resp.ok) {
+            setResults(data || { error: `HTTP ${resp.status}` });
+            progressText.textContent = "Failed";
+            return;
+          }
+
+          // Backend processes concurrently; we don't get streaming progress in this simple version.
+          // Show final counts and full results.
+          setProgress(selectedFiles.length, selectedFiles.length);
+          setResults(data);
+
+          if (data && data.downloadUrl) {
+            downloadBtn.href = data.downloadUrl;
+            downloadBtn.classList.remove("hidden");
+          }
+          progressText.textContent = `Done. Success: ${data.successCount}, Errors: ${data.errorCount}`;
+
+        } catch (err) {
+          setResults({ error: String(err) });
+          progressText.textContent = "Failed";
+        } finally {
+          startBtn.disabled = false;
+        }
+      }
+
+      startBtn.addEventListener("click", startBatchUpscale);
+
+      // Initial state
+      updateUIAfterSelection();
+    </script>
+  </body>
+</html>
